@@ -8,6 +8,7 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <fitsio.h>
+#include <time.h>
 
 int main(int argc, char *argv[]) {
     // Default values for options
@@ -238,6 +239,7 @@ int main(int argc, char *argv[]) {
 
     double time_accumulated = 0.0;
     long current_fits_slice = 0;
+    time_t start_time = time(NULL);
 
     while (av_read_frame(fmt_ctx, packet) >= 0) {
         if (max_frames > 0 && current_fits_slice >= max_frames) {
@@ -326,8 +328,15 @@ int main(int argc, char *argv[]) {
 
                         current_fits_slice++;
 
+                        time_t now = time(NULL);
+                        double elapsed = difftime(now, start_time);
+                        int elapsed_h = (int)(elapsed / 3600);
+                        int elapsed_m = (int)((elapsed - elapsed_h * 3600) / 60);
+                        int elapsed_s = (int)(elapsed - elapsed_h * 3600 - elapsed_m * 60);
+
                         printf("\rProcessing: Wrote slice %ld", current_fits_slice);
                         if (max_frames > 0) printf(" / %ld", max_frames);
+                        printf(" | Elapsed: %02d:%02d:%02d", elapsed_h, elapsed_m, elapsed_s);
                         fflush(stdout);
                     }
                 }
@@ -356,7 +365,16 @@ int main(int argc, char *argv[]) {
         }
         free(output_buffer);
         current_fits_slice++;
+
+        time_t now = time(NULL);
+        double elapsed = difftime(now, start_time);
+        int elapsed_h = (int)(elapsed / 3600);
+        int elapsed_m = (int)((elapsed - elapsed_h * 3600) / 60);
+        int elapsed_s = (int)(elapsed - elapsed_h * 3600 - elapsed_m * 60);
+
         printf("\rProcessing: Wrote slice %ld", current_fits_slice);
+        if (max_frames > 0) printf(" / %ld", max_frames);
+        printf(" | Elapsed: %02d:%02d:%02d", elapsed_h, elapsed_m, elapsed_s);
         fflush(stdout);
     }
 
