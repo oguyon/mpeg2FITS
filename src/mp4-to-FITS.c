@@ -10,14 +10,59 @@
 #include <fitsio.h>
 
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        printf("Usage: %s <color channel(s)> <time sampling [sec]> <mp4 video>\n", argv[0]);
+    // Default values for options
+    int binning = 1;
+    long max_frames = 0; // 0 means unlimited
+    int vflip = 0;
+    int hflip = 0;
+
+    int arg_idx = 1;
+    while (arg_idx < argc && argv[arg_idx][0] == '-') {
+        if (strcmp(argv[arg_idx], "-b") == 0) {
+            if (arg_idx + 1 >= argc) {
+                fprintf(stderr, "Error: -b requires an argument\n");
+                return 1;
+            }
+            binning = atoi(argv[arg_idx + 1]);
+            arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "-n") == 0) {
+            if (arg_idx + 1 >= argc) {
+                fprintf(stderr, "Error: -n requires an argument\n");
+                return 1;
+            }
+            max_frames = atol(argv[arg_idx + 1]);
+            arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "--vflip") == 0) {
+            vflip = 1;
+            arg_idx += 1;
+        } else if (strcmp(argv[arg_idx], "--hflip") == 0) {
+            hflip = 1;
+            arg_idx += 1;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[arg_idx]);
+            return 1;
+        }
+    }
+
+    // Check if we have enough positional arguments
+    if (argc - arg_idx != 3) {
+        printf("Usage: %s [options] <color channel(s)> <time sampling [sec]> <mp4 video>\n", argv[0]);
+        printf("Options:\n");
+        printf("  -b <binning>   Binning factor (default 1)\n");
+        printf("  -n <max>       Max number of output frames (default unlimited)\n");
+        printf("  --vflip        Flip vertically\n");
+        printf("  --hflip        Flip horizontally\n");
         return 1;
     }
 
-    const char *channel_arg = argv[1];
-    const char *time_arg = argv[2];
-    const char *video_path = argv[3];
+    if (binning < 1) {
+        fprintf(stderr, "Error: Binning must be >= 1\n");
+        return 1;
+    }
+
+    const char *channel_arg = argv[arg_idx];
+    const char *time_arg = argv[arg_idx + 1];
+    const char *video_path = argv[arg_idx + 2];
 
     int use_rgb = 0;
     if (strcmp(channel_arg, "R") == 0) {
@@ -93,6 +138,17 @@ int main(int argc, char *argv[]) {
     int width = codec_ctx->width;
     int height = codec_ctx->height;
 
+    // Calculate output dimensions based on binning
+    int out_width = width / binning;
+    int out_height = height / binning;
+
+    if (out_width == 0 || out_height == 0) {
+        fprintf(stderr, "Error: Binning factor %d is too large for resolution %dx%d\n", binning, width, height);
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&fmt_ctx);
+        return 1;
+    }
+
     // FPS
     double fps = 0.0;
     if (fmt_ctx->streams[video_stream_idx]->avg_frame_rate.den > 0) {
@@ -108,9 +164,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Processing:\n");
-    printf("  Resolution: %dx%d\n", width, height);
+    printf("Processing Configuration:\n");
+    printf("  Input Resolution: %dx%d\n", width, height);
     printf("  FPS: %.2f\n", fps);
+    printf("  Binning: %d\n", binning);
+    printf("  VFlip: %s\n", vflip ? "Yes" : "No");
+    printf("  HFlip: %s\n", hflip ? "Yes" : "No");
+    if (max_frames > 0) {
+        printf("  Max Output Frames: %ld\n", max_frames);
+    } else {
+        printf("  Max Output Frames: Unlimited\n");
+    }
 
     // Prepare for reading frames
     AVFrame *frame = av_frame_alloc();
@@ -131,7 +195,7 @@ int main(int argc, char *argv[]) {
     // Prepare accumulation buffer
     long frame_count_in_sample = 0;
     // Buffer for accumulated values (using float to prevent overflow and easy division)
-    float *accumulation_buffer = (float *)calloc(width * height, sizeof(float));
+    float *accumulation_buffer = (float *)calloc(out_width * out_height, sizeof(float));
 
     // FITS setup
     char output_filename[1024];
@@ -148,7 +212,7 @@ int main(int argc, char *argv[]) {
 
     fitsfile *fptr;
     int status = 0;
-    long naxes[3] = {width, height, 0}; // Time axis will grow
+    long naxes[3] = {out_width, out_height, 0}; // Time axis will grow
 
     // Delete if exists
     remove(output_filename);
@@ -159,11 +223,11 @@ int main(int argc, char *argv[]) {
     }
 
     // Create primary array image (3D cube)
-    // We don't know the exact number of frames yet, but we can update NAXIS3 later or just append?
-    // Usually standard FITS requires NAXIS to be set.
-    // Let's estimate total frames.
     double duration = (double)fmt_ctx->duration / AV_TIME_BASE;
     int estimated_fits_frames = (int)(duration / time_sampling) + 1;
+    if (max_frames > 0 && estimated_fits_frames > max_frames) {
+        estimated_fits_frames = max_frames;
+    }
     naxes[2] = estimated_fits_frames;
 
     // We will use FLOAT_IMG for the output as it is an average
@@ -173,23 +237,47 @@ int main(int argc, char *argv[]) {
     }
 
     double time_accumulated = 0.0;
-    int fits_frame_idx = 1; // FITS matches 1-based indexing for planes? No, fits_write_img uses long fpixel[].
-    // Note: cfitsio often takes 1-based coordinates for start pixel.
-
     long current_fits_slice = 0;
 
     while (av_read_frame(fmt_ctx, packet) >= 0) {
+        if (max_frames > 0 && current_fits_slice >= max_frames) {
+             av_packet_unref(packet);
+             break;
+        }
+
         if (packet->stream_index == video_stream_idx) {
             if (avcodec_send_packet(codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+                    if (max_frames > 0 && current_fits_slice >= max_frames) {
+                        break;
+                    }
+
                     // Convert to RGB
                     sws_scale(sws_ctx, (uint8_t const * const *)frame->data,
                               frame->linesize, 0, height,
                               rgb_frame->data, rgb_frame->linesize);
 
-                    // Accumulate
+                    // Accumulate with binning and flipping
                     for (int y = 0; y < height; y++) {
+                        int dest_y;
+                        if (vflip) {
+                            dest_y = (height - 1 - y) / binning;
+                        } else {
+                            dest_y = y / binning;
+                        }
+
+                        if (dest_y >= out_height) continue; // Should catch boundary if height/binning has remainder
+
                         for (int x = 0; x < width; x++) {
+                            int dest_x;
+                            if (hflip) {
+                                dest_x = (width - 1 - x) / binning;
+                            } else {
+                                dest_x = x / binning;
+                            }
+
+                            if (dest_x >= out_width) continue;
+
                             // RGB24: 3 bytes per pixel
                             uint8_t *ptr = rgb_frame->data[0] + y * rgb_frame->linesize[0] + x * 3;
                             uint8_t r = ptr[0];
@@ -205,25 +293,25 @@ int main(int argc, char *argv[]) {
                                 val = (float)r;
                             }
 
-                            accumulation_buffer[y * width + x] += val;
+                            accumulation_buffer[dest_y * out_width + dest_x] += val;
                         }
                     }
                     frame_count_in_sample++;
 
                     // Check time
-                    // frame->pts is presentation timestamp
-                    // We can estimate time per frame as 1/fps
                     time_accumulated += (1.0 / fps);
 
                     if (time_accumulated >= time_sampling) {
                         // Write to FITS
-                        float *output_buffer = (float *)malloc(width * height * sizeof(float));
-                        for (int i = 0; i < width * height; i++) {
-                            output_buffer[i] = accumulation_buffer[i] / frame_count_in_sample;
+                        float *output_buffer = (float *)malloc(out_width * out_height * sizeof(float));
+                        float normalization = frame_count_in_sample * binning * binning;
+
+                        for (int i = 0; i < out_width * out_height; i++) {
+                            output_buffer[i] = accumulation_buffer[i] / normalization;
                         }
 
                         long fpixel[3] = {1, 1, current_fits_slice + 1};
-                        long nelements = width * height;
+                        long nelements = out_width * out_height;
 
                         if (fits_write_pix(fptr, TFLOAT, fpixel, nelements, output_buffer, &status)) {
                              fits_report_error(stderr, status);
@@ -232,16 +320,15 @@ int main(int argc, char *argv[]) {
                         free(output_buffer);
 
                         // Reset
-                        memset(accumulation_buffer, 0, width * height * sizeof(float));
+                        memset(accumulation_buffer, 0, out_width * out_height * sizeof(float));
                         frame_count_in_sample = 0;
-                        time_accumulated -= time_sampling; // keep residue? or reset to 0?
-                        // Usually reset to 0 implies "next bin".
-                        // But if frame rate doesn't match sampling perfectly, we might drift.
-                        // Ideally we check timestamps. But averaging 'frames of this time sample' implies strict bins.
-                        // Let's reset time_accumulated to 0 for simplicity or handle residue.
-                        // If I subtract, I keep phase.
+                        time_accumulated -= time_sampling;
 
                         current_fits_slice++;
+
+                        printf("\rProcessing: Wrote slice %ld", current_fits_slice);
+                        if (max_frames > 0) printf(" / %ld", max_frames);
+                        fflush(stdout);
                     }
                 }
             }
@@ -250,26 +337,30 @@ int main(int argc, char *argv[]) {
     }
 
     // Handle remaining frames if any?
-    // If we have some accumulated frames but didn't reach time_sampling threshold at the end,
-    // should we write them?
     // "One output frame is the average of input frames of this time sample"
-    // If the last bin is incomplete, usually we dump it.
+    // As before, we dump the last bin if it has frames, unless we hit max_frames.
 
-    if (frame_count_in_sample > 0) {
-        float *output_buffer = (float *)malloc(width * height * sizeof(float));
-        for (int i = 0; i < width * height; i++) {
-            output_buffer[i] = accumulation_buffer[i] / frame_count_in_sample;
+    if (frame_count_in_sample > 0 && (max_frames == 0 || current_fits_slice < max_frames)) {
+        float *output_buffer = (float *)malloc(out_width * out_height * sizeof(float));
+        float normalization = frame_count_in_sample * binning * binning;
+
+        for (int i = 0; i < out_width * out_height; i++) {
+            output_buffer[i] = accumulation_buffer[i] / normalization;
         }
 
         long fpixel[3] = {1, 1, current_fits_slice + 1};
-        long nelements = width * height;
+        long nelements = out_width * out_height;
 
         if (fits_write_pix(fptr, TFLOAT, fpixel, nelements, output_buffer, &status)) {
              fits_report_error(stderr, status);
         }
         free(output_buffer);
         current_fits_slice++;
+        printf("\rProcessing: Wrote slice %ld", current_fits_slice);
+        fflush(stdout);
     }
+
+    printf("\n"); // Newline after progress
 
     // Update NAXIS3 to actual number of slices
     if (fits_update_key(fptr, TLONG, "NAXIS3", &current_fits_slice, "number of time steps", &status)) {
